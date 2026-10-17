@@ -333,3 +333,8 @@ Test coverage includes:
 - **IDN / Punycode**: Domain names must be ASCII; internationalized domain names (IDN) should be converted to punycode (`xn--`) prior to querying.
 - **Negative Caching**: While SOA records are parsed and minimum TTL is extracted, negative caching of NXDOMAIN/NODATA across process runs is not persisted by default.
 - **DoH / DoT**: DNS-over-HTTPS and DNS-over-TLS are not implemented; transport is strictly standard POSIX UDP/TCP port 53.
+
+
+Developer
+
+Love Patidar | Electrical Engineering, MANIT Bhopal
