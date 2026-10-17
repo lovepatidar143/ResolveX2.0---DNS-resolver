@@ -5,3 +5,5 @@ cmake-build-*/
 .DS_Store
 *.o
 *.dSYM/
+.resolvex.cache
+.cache_resolvex.dat

@@ -14,6 +14,7 @@ namespace {
 constexpr std::size_t kHeaderSize = 12;
 constexpr std::size_t kMaxLabelLength = 63;
 constexpr std::size_t kMaxNameWireLength = 255;
+constexpr std::size_t kMaxJumps = 64;
 
 std::string hex16(std::uint16_t v) {
     char buf[8];
@@ -40,6 +41,13 @@ std::uint32_t read_u32(const Bytes& p, std::size_t off) {
 
 void put_u16(Bytes& out, std::uint16_t v) {
     out.push_back(static_cast<std::uint8_t>(v >> 8));
+    out.push_back(static_cast<std::uint8_t>(v & 0xFF));
+}
+
+void put_u32(Bytes& out, std::uint32_t v) {
+    out.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFF));
+    out.push_back(static_cast<std::uint8_t>((v >> 16) & 0xFF));
+    out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFF));
     out.push_back(static_cast<std::uint8_t>(v & 0xFF));
 }
 
@@ -102,33 +110,84 @@ ResourceRecord parse_record(const Bytes& p, std::size_t& off) {
     const std::uint16_t rdlength = read_u16(p, off + 8);
     off += 10;
     require(p, off, rdlength, "record data");
+    const std::size_t rdata_start = off;
     const std::size_t rdata_end = off + rdlength;
+
+    rr.raw_rdata.assign(p.begin() + static_cast<std::ptrdiff_t>(rdata_start),
+                        p.begin() + static_cast<std::ptrdiff_t>(rdata_end));
 
     switch (rr.type) {
         case static_cast<std::uint16_t>(RecordType::A):
             if (rdlength != 4) throw DnsError("A record must have 4 bytes of data, got " + std::to_string(rdlength));
             rr.data = format_address(AF_INET, p, off);
+            off = rdata_end;
             break;
         case static_cast<std::uint16_t>(RecordType::AAAA):
             if (rdlength != 16) throw DnsError("AAAA record must have 16 bytes of data, got " + std::to_string(rdlength));
             rr.data = format_address(AF_INET6, p, off);
+            off = rdata_end;
             break;
         case static_cast<std::uint16_t>(RecordType::NS):
             rr.data = decode_rdata_name(p, off, rdata_end, "NS");
+            off = rdata_end;
             break;
         case static_cast<std::uint16_t>(RecordType::CNAME):
             rr.data = decode_rdata_name(p, off, rdata_end, "CNAME");
+            off = rdata_end;
+            break;
+        case static_cast<std::uint16_t>(RecordType::PTR):
+            rr.data = decode_rdata_name(p, off, rdata_end, "PTR");
+            off = rdata_end;
             break;
         case static_cast<std::uint16_t>(RecordType::MX):
             if (rdlength < 3) throw DnsError("MX record too short");
             rr.mx_preference = read_u16(p, off);
             rr.data = decode_rdata_name(p, off + 2, rdata_end, "MX");
+            off = rdata_end;
+            break;
+        case static_cast<std::uint16_t>(RecordType::SOA): {
+            std::size_t cur = off;
+            rr.soa.mname = decode_name(p, cur);
+            rr.soa.rname = decode_name(p, cur);
+            require(p, cur, 20, "SOA numeric fields");
+            rr.soa.serial = read_u32(p, cur); cur += 4;
+            rr.soa.refresh = read_u32(p, cur); cur += 4;
+            rr.soa.retry = read_u32(p, cur); cur += 4;
+            rr.soa.expire = read_u32(p, cur); cur += 4;
+            rr.soa.minimum = read_u32(p, cur); cur += 4;
+            if (cur != rdata_end) throw DnsError("SOA record data length mismatch");
+            rr.data = rr.soa.mname + " " + rr.soa.rname + " " + std::to_string(rr.soa.serial) +
+                      " " + std::to_string(rr.soa.refresh) + " " + std::to_string(rr.soa.retry) +
+                      " " + std::to_string(rr.soa.expire) + " " + std::to_string(rr.soa.minimum);
+            off = rdata_end;
+            break;
+        }
+        case static_cast<std::uint16_t>(RecordType::TXT): {
+            std::size_t cur = off;
+            std::string full_txt;
+            while (cur < rdata_end) {
+                const std::uint8_t slen = p[cur++];
+                require(p, cur, slen, "TXT segment");
+                if (!full_txt.empty()) full_txt += " ";
+                full_txt += "\"";
+                for (std::size_t i = 0; i < slen; ++i) append_label_byte(full_txt, p[cur + i]);
+                full_txt += "\"";
+                cur += slen;
+            }
+            rr.data = full_txt;
+            off = rdata_end;
+            break;
+        }
+        case static_cast<std::uint16_t>(RecordType::OPT):
+            // RFC 6891: rr.cls is requestor UDP payload size
+            rr.data = "EDNS payload=" + std::to_string(rr.cls);
+            off = rdata_end;
             break;
         default:
             rr.data = "<" + std::to_string(rdlength) + " bytes of unsupported type " + std::to_string(rr.type) + ">";
+            off = rdata_end;
             break;
     }
-    off = rdata_end;
     return rr;
 }
 
@@ -141,8 +200,12 @@ std::string record_type_name(std::uint16_t type) {
         case 1: return "A";
         case 2: return "NS";
         case 5: return "CNAME";
+        case 6: return "SOA";
+        case 12: return "PTR";
         case 15: return "MX";
+        case 16: return "TXT";
         case 28: return "AAAA";
+        case 41: return "OPT";
         default: return "TYPE" + std::to_string(type);
     }
 }
@@ -153,7 +216,10 @@ bool parse_record_type(const std::string& text, RecordType& out) {
     if (up == "A") out = RecordType::A;
     else if (up == "AAAA") out = RecordType::AAAA;
     else if (up == "CNAME") out = RecordType::CNAME;
+    else if (up == "SOA") out = RecordType::SOA;
+    else if (up == "PTR") out = RecordType::PTR;
     else if (up == "MX") out = RecordType::MX;
+    else if (up == "TXT") out = RecordType::TXT;
     else if (up == "NS") out = RecordType::NS;
     else return false;
     return true;
@@ -189,6 +255,10 @@ std::string normalize_domain(const std::string& domain) {
 
 Bytes encode_name(const std::string& name) {
     Bytes out;
+    if (name.empty() || name == ".") {
+        out.push_back(0);
+        return out;
+    }
     std::size_t start = 0;
     while (start < name.size()) {
         std::size_t dot = name.find('.', start);
@@ -204,19 +274,34 @@ Bytes encode_name(const std::string& name) {
     return out;
 }
 
-Bytes encode_query(const std::string& domain, RecordType type, std::uint16_t id) {
+Bytes encode_query(const std::string& domain, RecordType type, std::uint16_t id,
+                   bool recursion_desired, bool use_edns, std::uint16_t edns_buf_size) {
     const std::string name = normalize_domain(domain);
     Bytes packet;
     put_u16(packet, id);
-    put_u16(packet, 0x0100);  // standard query, recursion desired
-    put_u16(packet, 1);       // QDCOUNT
-    put_u16(packet, 0);       // ANCOUNT
-    put_u16(packet, 0);       // NSCOUNT
-    put_u16(packet, 0);       // ARCOUNT
+
+    // Flags: opcode=0 (QUERY), RD bit set conditionally
+    const std::uint16_t flags = recursion_desired ? 0x0100 : 0x0000;
+    put_u16(packet, flags);
+    put_u16(packet, 1);                                 // QDCOUNT
+    put_u16(packet, 0);                                 // ANCOUNT
+    put_u16(packet, 0);                                 // NSCOUNT
+    put_u16(packet, use_edns ? 1 : 0);                 // ARCOUNT (1 if EDNS OPT RR attached)
+
     const Bytes qname = encode_name(name);
     packet.insert(packet.end(), qname.begin(), qname.end());
     put_u16(packet, static_cast<std::uint16_t>(type));
     put_u16(packet, kClassIN);
+
+    if (use_edns) {
+        // RFC 6891 OPT pseudo-RR
+        packet.push_back(0);                             // Root domain name
+        put_u16(packet, static_cast<std::uint16_t>(RecordType::OPT));  // Type 41
+        put_u16(packet, edns_buf_size);                  // UDP payload size in CLASS
+        put_u32(packet, 0);                             // Extended RCODE, Version 0, Flags (DO=0)
+        put_u16(packet, 0);                             // RDLENGTH = 0
+    }
+
     return packet;
 }
 
@@ -236,10 +321,11 @@ Header parse_header(const Bytes& p) {
 
 std::string decode_name(const Bytes& p, std::size_t& offset) {
     std::size_t pos = offset;
-    std::size_t resume = 0;  // where the caller continues (after the first pointer)
+    std::size_t resume = 0;  // where caller continues after first jump
     bool jumped = false;
-    std::size_t wire_length = 1;  // the terminating zero byte
+    std::size_t wire_length = 1;  // terminating zero byte
     std::string name;
+    std::size_t jumps = 0;
 
     for (;;) {
         require(p, pos, 1, "name length byte");
@@ -256,8 +342,9 @@ std::string decode_name(const Bytes& p, std::size_t& offset) {
                 resume = pos + 2;
                 jumped = true;
             }
-            // Valid compression only points backwards. Requiring this makes
-            // infinite pointer loops impossible.
+            if (++jumps > kMaxJumps) throw DnsError("too many compression pointer jumps");
+            if (target >= p.size()) throw DnsError("compression pointer out of packet bounds");
+            // RFC 1035: compression pointers must point backwards to already-encoded names
             if (target >= pos) throw DnsError("invalid compression pointer (not pointing backwards)");
             pos = target;
             continue;
@@ -288,6 +375,39 @@ std::string rcode_message(std::uint8_t rcode) {
     }
 }
 
+Response parse_packet(const Bytes& p) {
+    Response r;
+    r.header = parse_header(p);
+    r.truncated = r.header.truncated();
+    r.rcode = r.header.rcode();
+
+    std::size_t off = kHeaderSize;
+    if (r.header.qdcount >= 1) {
+        r.question = parse_question(p, off);
+    }
+
+    if (r.truncated) {
+        return r;
+    }
+
+    r.answers.reserve(std::min<std::size_t>(r.header.ancount, 64));
+    for (std::uint16_t i = 0; i < r.header.ancount; ++i) {
+        r.answers.push_back(parse_record(p, off));
+    }
+
+    r.authorities.reserve(std::min<std::size_t>(r.header.nscount, 64));
+    for (std::uint16_t i = 0; i < r.header.nscount; ++i) {
+        r.authorities.push_back(parse_record(p, off));
+    }
+
+    r.additionals.reserve(std::min<std::size_t>(r.header.arcount, 64));
+    for (std::uint16_t i = 0; i < r.header.arcount; ++i) {
+        r.additionals.push_back(parse_record(p, off));
+    }
+
+    return r;
+}
+
 Response parse_response(const Bytes& p, std::uint16_t expected_id, const Question& expected) {
     Response r;
     r.header = parse_header(p);
@@ -310,15 +430,23 @@ Response parse_response(const Bytes& p, std::uint16_t expected_id, const Questio
 
     r.truncated = r.header.truncated();
     r.rcode = r.header.rcode();
-    // Truncated packets are incomplete; error responses carry no answers we need.
-    if (r.truncated || r.rcode != 0) return r;
+    if (r.truncated) return r;
 
     r.answers.reserve(std::min<std::size_t>(r.header.ancount, 64));
-    for (std::uint16_t i = 0; i < r.header.ancount; ++i) r.answers.push_back(parse_record(p, off));
-    // Validate (but discard) authority and additional sections so a corrupt
-    // packet is rejected as a whole.
-    const std::size_t extra = static_cast<std::size_t>(r.header.nscount) + r.header.arcount;
-    for (std::size_t i = 0; i < extra; ++i) parse_record(p, off);
+    for (std::uint16_t i = 0; i < r.header.ancount; ++i) {
+        r.answers.push_back(parse_record(p, off));
+    }
+
+    r.authorities.reserve(std::min<std::size_t>(r.header.nscount, 64));
+    for (std::uint16_t i = 0; i < r.header.nscount; ++i) {
+        r.authorities.push_back(parse_record(p, off));
+    }
+
+    r.additionals.reserve(std::min<std::size_t>(r.header.arcount, 64));
+    for (std::uint16_t i = 0; i < r.header.arcount; ++i) {
+        r.additionals.push_back(parse_record(p, off));
+    }
+
     return r;
 }
 
